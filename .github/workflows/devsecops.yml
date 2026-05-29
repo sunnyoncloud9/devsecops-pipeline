@@ -1,0 +1,220 @@
+name: 🛡️ DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Weekly full security scan every Monday 9am UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 1 — SAST (Static Application Security Testing)
+  # ───────────────────────────────────────────────────────────────────────────
+  sast:
+    name: 🔍 SAST — Static Code Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Bandit (Python SAST)
+        run: |
+          pip install bandit
+          mkdir -p reports
+          bandit -r sample-app/ -f json -o reports/bandit.json || true
+          bandit -r sample-app/ --severity-level medium || echo "::warning::Bandit found medium+ severity issues"
+
+      - name: Run Semgrep (Multi-language SAST)
+        run: |
+          pip install semgrep
+          semgrep --config=auto sample-app/ --json --output reports/semgrep.json || true
+          semgrep --config=auto sample-app/ || echo "::warning::Semgrep found issues"
+
+      - name: Upload SAST reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-reports
+          path: reports/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — SCA (Software Composition Analysis / Dependency Scanning)
+  # ───────────────────────────────────────────────────────────────────────────
+  sca:
+    name: 📦 SCA — Dependency Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run pip-audit (Dependency CVE scan)
+        run: |
+          pip install pip-audit
+          mkdir -p reports
+          pip-audit -r sample-app/requirements.txt --format json --output reports/pip-audit.json || true
+          pip-audit -r sample-app/requirements.txt || echo "::warning::pip-audit found vulnerable dependencies"
+
+      - name: Run Safety (Dependency scanner)
+        run: |
+          pip install safety
+          safety check -r sample-app/requirements.txt --json > reports/safety.json || true
+
+      - name: Upload SCA reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-reports
+          path: reports/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 3 — Secret Scanning
+  # ───────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: 🔑 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for secret scanning
+
+      - name: Run Gitleaks (Secret detection)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Run detect-secrets
+        run: |
+          pip install detect-secrets
+          mkdir -p reports
+          detect-secrets scan --all-files > reports/detect-secrets.json || true
+          echo "Secret scan complete."
+
+      - name: Upload secret scan reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secret-scan-reports
+          path: reports/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 4 — Container Image Scanning
+  # ───────────────────────────────────────────────────────────────────────────
+  container-scan:
+    name: 🐳 Container Image Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t sample-app:${{ github.sha }} ./sample-app
+
+      - name: Run Trivy (Container vulnerability scanner)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sample-app:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Run Trivy (table output for logs)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sample-app:${{ github.sha }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+        continue-on-error: true
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-scan-reports
+          path: trivy-results.sarif
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 5 — IaC (Infrastructure as Code) Scanning
+  # ───────────────────────────────────────────────────────────────────────────
+  iac-scan:
+    name: 🏗️ IaC Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov (IaC scanner)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: iac/
+          output_format: cli,json
+          output_file_path: console,reports/checkov.json
+          soft_fail: true
+        continue-on-error: true
+
+      - name: Upload IaC scan reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iac-scan-reports
+          path: reports/
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # STAGE 6 — Security Gate (Aggregates all results)
+  # ───────────────────────────────────────────────────────────────────────────
+  security-gate:
+    name: 🚦 Security Gate
+    runs-on: ubuntu-latest
+    needs: [sast, sca, secret-scan, container-scan, iac-scan]
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Evaluate Security Gate
+        run: |
+          python scripts/security_gate.py all-reports/
+
+      - name: Pipeline Summary
+        if: always()
+        run: |
+          echo "## 🛡️ DevSecOps Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Static Analysis) | ${{ needs.sast.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SCA (Dependencies) | ${{ needs.sca.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scanning | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scanning | ${{ needs.container-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| IaC Scanning | ${{ needs.iac-scan.result }} |" >> $GITHUB_STEP_SUMMARY
